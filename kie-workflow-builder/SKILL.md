@@ -7,6 +7,141 @@ description: Build n8n sub-workflows from kie.ai model documentation URLs. Use t
 
 This skill builds n8n sub-workflows that call the kie.ai API. Given a model documentation URL, it extracts the payload schema, builds a Zod validator inside a Super Code node, wires up the standard create-task → poll-loop → return pipeline, and outputs a ready-to-use workflow.
 
+## Workflow Creation Process
+
+### Step 1: Fetch and Parse Documentation
+
+1. Fetch the documentation page from the provided URL
+2. Extract the following from the docs:
+   - **Model identifier** — the `model` string (e.g. `seedream/5-lite-text-to-image`)
+   - **Input parameters** — name, type, required/optional, options/enum values, defaults, max constraints
+   - **Output type** — image, video, or text (determined from `resultUrls` context and model name suffixes)
+
+### Step 2: Determine Model Category
+
+Infer from the model name what the output is:
+
+| Suffix | Output | Return field name | "Get Generated" node name |
+|--------|--------|-------------------|--------------------------|
+| T2I / I2I / image-to-image | Image | `generated_image` | Get Generated Image |
+| T2V / I2V / V2V / image-to-video | Video | `generated_video` | Get Generated Video |
+| text / other | Text (via `resultObject`) | `generated_text` | Get Generated Result |
+
+### Step 3: Build the Zod Schema
+
+Read the parameters table from the docs and construct a Zod schema inside the Super Code node. Follow these rules:
+
+**Schema structure:**
+```javascript
+const Schema = z.object({
+  model: z.string().default("<model-identifier>"),
+  input: z.object({
+    // ... one field per input parameter from docs
+  })
+})
+```
+
+**Field rules:**
+- `prompt` (string): always include, use `max()` from docs, no `.optional()`
+- `image_urls` (array of URLs): always include when docs say "Required: Yes" and type is array; use `z.array(z.string().url())`; add `.max(N)` only if docs specify a max count
+- Enum fields: use `z.enum([...])` with exact values from docs; include `.default()` with the docs default
+- Number fields with range: use `z.number().int().min(X).max(Y).default(Z)`
+- Boolean fields: use `z.boolean().default(value)` if docs provide a default
+- Optional fields: append `.optional()`
+- **ALWAYS exclude `nsfw_checker`** — never include this parameter in the schema or payload, even if present in the docs
+
+**Refinements** — Only add `.refine()` when there are genuine cross-field dependencies visible in the docs (e.g., "cannot use both X and Y simultaneously"). Do not invent refinements that aren't in the docs.
+
+**Final formatter** — The Super Code node always transforms the validated data into the API format:
+```javascript
+(data) => {
+  const {model, ...rest} = data
+  return {model, input: rest}
+}
+```
+
+### Step 4: Duplicate Source Workflow (Full Duplicate)
+
+**MANDATORY**: Always duplicate from an existing kie.ai workflow. Never build node-by-node from scratch. Duplicating preserves all subtle configuration details (Switch rules with condition IDs, HTTP Request options, authentication setup, etc.).
+
+**Steps:**
+1. Use `n8n_get_workflow` on the source workflow with `mode: "full"`
+2. Clear the `id` field from the workflow JSON and from every node
+3. **DO NOT CHANGE ANYTHING EXCEPT the following:**
+   - **Start node**: update workflow inputs to match new schema (one input per `input` field)
+   - **Super Code node**: update Zod schema + model identifier ONLY (keep all helper functions verbatim)
+   - **Return node**: update output field names if needed (image vs video vs text)
+   - **"Get Generated [Media]" node**: rename to match output type (Image/Video/Result)
+   - **Sticky Note**: update docs URL
+
+**Preserve everything else exactly as-is from the source workflow:**
+- All HTTP Request configurations
+- All Switch node rules and conditions
+- All credential references
+- All connections
+- Wait node timing
+- Loop Over Items configuration
+
+### Step 5: Set the Start Node Inputs
+
+Map each Zod `input` field to a workflow input. Order: `prompt` first, then required fields, then optional fields. Set `type: "array"` on array fields. Do NOT include `nsfw_checker`.
+
+### Step 6: Build the Return Node
+
+The Return (Set) node shapes the output using the source workflow's assignments format (object type with inline expression):
+
+- **For image/video models** (output via `resultUrls`):
+  ```json
+  {
+    "assignments": {
+      "assignments": [
+        {
+          "name": "generated_image",
+          "type": "object",
+          "value": "={\n  url: \"{{ $json.data.resultJson.parseJson().resultUrls }}\",\n  filename: \"{{ $json.data.resultJson.parseJson().resultUrls[0].split('/').at(-1) }}\"\n}"
+        }
+      ]
+    },
+    "options": {}
+  }
+  ```
+  (Replace `generated_image` with `generated_video` for video models)
+
+- **For text models** (output via `resultObject`):
+  ```json
+  {
+    "assignments": {
+      "assignments": [
+        {
+          "name": "generated_text",
+          "type": "stringValue",
+          "value": "={{ $json.data.resultJson.parseJson().resultObject }}"
+        }
+      ]
+    },
+    "options": {}
+  }
+  ```
+
+### Step 7: Name the Workflow
+
+Format: `🧩 <provider> / <short-model-name>`
+
+Examples:
+- `seedream/5-lite-text-to-image` → `🧩 seedream / 5-lite T2I`
+- `kling/v2.6-image-to-video` → `🧩 kling / v2.6-I2V`
+- `grok-imagine/text-to-image` → `🧩 grok / imagine T2I`
+
+Use the suffix convention: T2I (text-to-image), I2I (image-to-image), T2V (text-to-video), I2V (image-to-video), V2V (video-to-video).
+
+### Step 8: Update the Sticky Note
+
+Set content to:
+```
+## Docs
+https://kie.ai/<provider>?model=<url-encoded-model-identifier>
+```
+
 ## Architecture
 
 Every kie.ai workflow follows the same pattern (13 nodes, 9 connections):
@@ -53,69 +188,54 @@ All HTTP Request nodes MUST use the same `httpBearerAuth` credential from the so
 > }
 > ```
 
-## Step-by-step workflow
+## Post-Creation Steps
 
-### 1. Fetch and parse the docs URL
+### 1. Auto-fix typeVersions
 
-Fetch the documentation page the user provides. Extract:
+Run `n8n_autofix_workflow` with `fixTypes: ["typeversion-upgrade"]`
 
-- **Model identifier** — the `model` string (e.g. `seedream/5-lite-image-to-image`)
-- **Input parameters** — name, type, required/optional, options/enum values, defaults, max constraints
-- **Output type** — image, video, or text (determined from `resultUrls` context and model name suffixes like T2I, I2I, T2V, I2V, V2V)
+### 2. Validate
 
-### 2. Determine the model category
+Run `n8n_validate_workflow` to check for issues
 
-Infer from the model name what the output is:
+### 3. Test with Webhook (Temporary)
 
-| Suffix | Output | Return field name | "Get Generated" node name |
-|--------|--------|-------------------|---------------------------|
-| T2I / I2I / image-to-image | Image | `generated_image` | Get Generated Image |
-| T2V / I2V / V2V / image-to-video | Video | `generated_video` | Get Generated Video |
-| text / other | Text (via `resultObject`) | `generated_text` | Get Generated Result |
+Add a temporary Webhook node for testing, then remove it after successful test:
 
-### 3. Build the Zod schema
+**Add Webhook:**
+- Node type: `n8n-nodes-base.webhook` v2
+- Set `path` to something unique like `<model-shortname>-t2i` (e.g., `seedream-t2i`)
+- Set `httpMethod` to `"POST"`
+- Set `responseMode` to `"lastNode"`
+- Position it before the Super Code node
+- Connect Webhook → Super Code
+- Temporarily disconnect Start (Execute Workflow Trigger) from Super Code
 
-Read the parameters table from the docs and construct a Zod schema inside the Super Code node. Follow these rules:
-
-**Schema structure:**
+**Test the workflow:**
 ```javascript
-const Schema = z.object({
-  model: z.string().default("<model-identifier>"),
-  input: z.object({
-    // ... one field per input parameter from docs
-  })
+n8n_test_workflow({
+  workflowId: "<created-workflow-id>",
+  triggerType: "webhook",
+  webhookPath: "<model-shortname>-t2i",
+  data: {
+    // Test payload matching the schema
+  }
 })
 ```
 
-**Field rules:**
-- `prompt` (string): always include, use `max()` from docs, no `.optional()`
-- `image_urls` (array of URLs): always include when docs say "Required: Yes" and type is array; use `z.array(z.string().url())`; add `.max(N)` only if docs specify a max count
-- Enum fields: use `z.enum([...])` with exact values from docs; include `.default()` with the docs default
-- Number fields with range: use `z.number().int().min(X).max(Y).default(Z)`
-- Boolean fields: use `z.boolean().default(value)` if docs provide a default
-- Optional fields: append `.optional()`
-- **ALWAYS exclude `nsfw_checker`** — never include this parameter in the schema or payload, even if present in the docs
+**After successful test:**
+- Remove the temporary Webhook node
+- Restore the Execute Workflow Trigger connection to Super Code
+- Update the workflow with the removed changes
 
-**Refinements** — Only add `.refine()` when there are genuine cross-field dependencies visible in the docs (e.g., "cannot use both X and Y simultaneously"). Do not invent refinements that aren't in the docs.
+### 4. Report
 
-**Final formatter** — The Super Code node always transforms the validated data into the API format:
-```javascript
-(data) => {
-  const {model, ...rest} = data
-  return {model, input: rest}
-}
-```
+Summarize what was created and what changed vs. the source
 
-### 4. Preserve the helper functions
+## Super Code Node Code Template
 
-The Super Code node includes four helper functions that must be kept verbatim from the source workflow:
+The Super Code node includes helper functions that must be kept verbatim. Only update the schema and model identifier:
 
-1. `getDefaults(schema)` — recursively extracts default values from a Zod schema
-2. `setDefaults(item, defaultConfig)` — merges input with defaults, removes null/undefined
-3. `processData(item, defaultConfig, formatDataFn)` — validates with safeParse, throws formatted error on failure
-4. Entry logic — handles both `item` (single) and `items` (batch) execution modes
-
-**Complete Super Code node code template** (adapt schema and model identifier):
 ```javascript
 const Schema = z.object({
   model: z.string().default("<model-identifier>"),
@@ -189,100 +309,7 @@ function processData(item, defaultConfig, formatDataFn = (data) => data){
 }
 ```
 
-### 5. Set the Start node inputs
-
-Map each Zod `input` field to a workflow input. Order: `prompt` first, then required fields, then optional fields. Set `type: "array"` on array fields. Do NOT include `nsfw_checker`.
-
-### 6. Build the Return node
-
-The Return (Set) node shapes the output using the source workflow's assignments format (object type with inline expression):
-
-- **For image/video models** (output via `resultUrls`):
-  ```json
-  {
-    "assignments": {
-      "assignments": [
-        {
-          "name": "generated_image",
-          "type": "object",
-          "value": "={\n  url: \"{{ $json.data.resultJson.parseJson().resultUrls }}\",\n  filename: \"{{ $json.data.resultJson.parseJson().resultUrls[0].split('/').at(-1) }}\"\n}"
-        }
-      ]
-    },
-    "options": {}
-  }
-  ```
-  (Replace `generated_image` with `generated_video` for video models)
-
-- **For text models** (output via `resultObject`):
-  ```json
-  {
-    "assignments": {
-      "assignments": [
-        {
-          "name": "generated_text",
-          "type": "stringValue",
-          "value": "={{ $json.data.resultJson.parseJson().resultObject }}"
-        }
-      ]
-    },
-    "options": {}
-  }
-  ```
-
-### 7. Name the workflow
-
-Format: `🧩 <provider> / <short-model-name>`
-
-Examples:
-- `seedream/5-lite-image-to-image` → `🧩 seedream / 5-lite-I2I`
-- `kling/v2.6-image-to-video` → `🧩 kling / v2.6-I2V`
-- `grok-imagine/text-to-image` → `🧩 grok / imagine T2I`
-
-Use the suffix convention: T2I (text-to-image), I2I (image-to-image), T2V (text-to-video), I2V (image-to-video), V2V (video-to-video).
-
-### 8. Update the Sticky Note
-
-Set content to:
-```
-## Docs
-https://kie.ai/<provider>?model=<url-encoded-model-identifier>
-```
-
-### 9. Duplicate the workflow from a source
-
-> **MANDATORY**: Always duplicate from an existing kie.ai workflow. Never build node-by-node from scratch. Duplicating preserves all subtle configuration details (Switch rules with condition IDs, HTTP Request options, authentication setup, etc.) that are extremely difficult to reconstruct correctly.
-
-**Steps:**
-1. Use `n8n_get_workflow` on the source workflow with `mode: "full"`
-2. Clear the `id` field from the workflow JSON and from every node
-3. Copy the exact Super Code node code structure, updating ONLY the schema and model identifier
-4. **Preserve the credentials exactly** from the source workflow — do NOT modify the `credentials` object on any node
-5. Update these nodes:
-   - **Super Code**: update Zod schema + model identifier (keep all helper functions verbatim)
-   - **Start node**: update workflow inputs to match new schema
-   - **Return node**: update output field names if needed (image vs video vs text)
-   - **"Get Generated [Media]" node**: rename to match output type (Image/Video/Result)
-   - **Sticky Note**: update docs URL
-6. Create with `n8n_create_workflow`
-
-### 10. Post-creation steps
-
-1. **Auto-fix typeVersions** — run `n8n_autofix_workflow` with `fixTypes: ["typeversion-upgrade"]`
-2. **Validate** — run `n8n_validate_workflow` to check for issues
-3. **Test the workflow** (optional but recommended):
-   - Add a **temporary Webhook node** (`n8n-nodes-base.webhook` v2) to the workflow
-     - Set `path` to something unique like `<model-shortname>-t2i` (e.g., `seedream-t2i`)
-     - Set `httpMethod` to `"POST"`
-     - Set `responseMode` to `"lastNode"`
-     - Position it before the Super Code node
-   - Connect Webhook → Super Code
-   - Update the Start (Execute Workflow Trigger) connections to disconnect it (or remove it temporarily)
-   - Use `n8n_test_workflow` with the webhook path and a test payload
-   - **After successful test**: remove the temporary Webhook node and restore the Execute Workflow Trigger connections
-4. **Report** — summarize what was created and what changed vs. the source
-
-## Switch node configurations
+## Switch Node Configurations
 
 ### Queued Switch (checks createTask response)
 
@@ -297,7 +324,7 @@ Preserve from source. Uses rules-based conditions (NOT expression mode):
 - **Output 1 "waiting"**: `$json.data.state` matches regex `^(waiting|queuing|generating)?$`
 - **Output 2 "failed"**: `$json.data.state` equals `"fail"` (string)
 
-## Quick reference: Standard node positions
+## Quick Reference: Standard Node Positions
 
 ```
 Start:                    [336, -208]
@@ -315,7 +342,7 @@ Wait:                     [1904, -208]
 Sticky Note:              [368, -448]
 ```
 
-## Quick reference: Standard connections
+## Quick Reference: Standard Connections
 
 ```json
 {
@@ -331,7 +358,7 @@ Sticky Note:              [368, -448]
 }
 ```
 
-## HTTP Request node configurations
+## HTTP Request Node Configurations
 
 ### Create Task (POST)
 
@@ -368,20 +395,24 @@ Sticky Note:              [368, -448]
 }
 ```
 
-## Error handling notes
+## Error Handling Notes
 
 - The **Queued** Switch checks `code === 200` (generating) vs not (error → Stop and Error1 with `$json.msg`)
 - The **Switch** (after polling) checks `data.state`: `success` → loop done, `waiting|queuing|generating` → wait & retry, `fail` → Stop and Error with `data.failMsg || data.errorMessage`
 - The **Wait** node uses a 5-second delay between polls
 
-## Critical rules
+## Critical Rules
 
 - **Never include `nsfw_checker`** in any schema, input, or payload — always skip it regardless of what the docs say
-- **ALWAYS use the Super Code node** (`@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1) — NEVER use `n8n-nodes-base.code` or any other node type as a fallback. The Super Code node must be installed on the n8n instance.
-- **ALWAYS duplicate from a source workflow** — never build node-by-node from scratch. Preserving Switch rules, credential references, and HTTP configurations is critical.
-- **Preserve credentials exactly** from the source workflow — copy the `credentials` object as-is on all HTTP Request nodes without modification
-- **Credential key MUST be `httpBearerAuth`** — never use `genericAuthType` or any other key in the `credentials` object
-- **Return node uses object-type assignments** — follow the source workflow format with `type: "object"` and inline expression values
-- Always auto-fix type versions after creation
-- The Super Code node must contain the complete Zod schema + all helper functions — no external dependencies
-- For testing: add a temporary Webhook node, test, then clean up and remove it afterward
+- **ALWAYS use the Super Code node** (`@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1) — NEVER use `n8n-nodes-base.code` or any other node type as a fallback
+- **ALWAYS duplicate from a source workflow** — never build node-by-node from scratch
+- **DO NOT CHANGE ANYTHING EXCEPT:**
+  - Start node inputs
+  - Super Code node (schema + model identifier only)
+  - Return node output field names
+  - "Get Generated [Media]" node name
+  - Sticky Note docs URL
+- **Preserve credentials exactly** from the source workflow
+- **Credential key MUST be `httpBearerAuth`**
+- **Always auto-fix type versions after creation**
+- **For testing: add temporary Webhook node, test, then remove it afterward**
