@@ -5,7 +5,7 @@ description: Build n8n sub-workflows from kie.ai model documentation URLs. Use t
 
 # Kie.ai → n8n Workflow Builder
 
-This skill builds n8n sub-workflows that call the kie.ai API. Given a model documentation URL, it extracts the payload schema, builds a Zod validator inside a Super Code node (with Code node fallback), wires up the standard create-task → poll-loop → return pipeline, and outputs a ready-to-use workflow.
+This skill builds n8n sub-workflows that call the kie.ai API. Given a model documentation URL, it extracts the payload schema, builds a Zod validator inside a Super Code node, wires up the standard create-task → poll-loop → return pipeline, and outputs a ready-to-use workflow.
 
 ## Architecture
 
@@ -25,8 +25,8 @@ Start → Super Code → Create Task → Queued → Loop Over Items → Return �
 
 | Node | Type | Purpose |
 |------|------|---------|
-| **Start** | Execute Workflow Trigger | Workflow inputs — one per schema field |
-| **Super Code** | `@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1 OR `n8n-nodes-base.code` v2 | Zod schema validation + payload construction |
+| **Start** | Execute Workflow Trigger v1.1 | Workflow inputs — one per schema field |
+| **Super Code** | `@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1 | Zod schema validation + payload construction |
 | **Create Task** | HTTP Request v4.4 | `POST https://api.kie.ai/api/v1/jobs/createTask` |
 | **Queued** | Switch v3.4 | Checks `$json.code === 200` (generating) vs not (error) |
 | **Stop and Error1** | Stop and Error v1 | Shows `$json.msg` when queueing fails |
@@ -36,12 +36,12 @@ Start → Super Code → Create Task → Queued → Loop Over Items → Return �
 | **Wait** | Code v2 | `await new Promise(r => setTimeout(r, 5000))` — 5s polling delay |
 | **Return** | Set v3.4 | Shapes the output: `generated_image`, `generated_video`, etc. |
 | **No Operation** | NoOp v1 | Terminal node after Return |
-| **Stop and Error** | Stop and Error v1 | Shows `$json.data.failMsg || $json.data.errorMessage` |
+| **Stop and Error** | Stop and Error v1 | Shows `$json.data.failMsg \|\| $json.data.errorMessage` |
 | **Sticky Note** | Sticky Note v1 | Docs URL reference |
 
 ### Credentials
 
-All HTTP Request nodes use `httpBearerAuth` credential named **"Kie.ai Token"** (credential ID: `gv9noTXHGc9OkhZy`).
+All HTTP Request nodes MUST use the same `httpBearerAuth` credential from the source workflow. When duplicating, preserve the credentials object exactly as-is from the source.
 
 > **IMPORTANT**: The credential key in the `credentials` object MUST be `httpBearerAuth`, NOT `genericAuthType` or any other key. Example:
 > ```json
@@ -75,7 +75,7 @@ Infer from the model name what the output is:
 
 ### 3. Build the Zod schema
 
-Read the parameters table from the docs and construct a Zod schema inside the Super Code node (or Code node fallback — see section 3b). Follow these rules:
+Read the parameters table from the docs and construct a Zod schema inside the Super Code node. Follow these rules:
 
 **Schema structure:**
 ```javascript
@@ -98,7 +98,7 @@ const Schema = z.object({
 
 **Refinements** — Only add `.refine()` when there are genuine cross-field dependencies visible in the docs (e.g., "cannot use both X and Y simultaneously"). Do not invent refinements that aren't in the docs.
 
-**Final formatter** — The node always transforms the validated data into the API format:
+**Final formatter** — The Super Code node always transforms the validated data into the API format:
 ```javascript
 (data) => {
   const {model, ...rest} = data
@@ -106,33 +106,88 @@ const Schema = z.object({
 }
 ```
 
-### 3b. Super Code vs Code node fallback
-
-**Preferred**: Use `@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1 (the Super Code node). This node supports Zod natively and has a built-in schema validation UI.
-
-**Fallback**: If the Super Code community node is NOT installed on the n8n instance (you'll get a validation error referencing `@kenkaiii/n8n-nodes-supercode`), fall back to the standard `n8n-nodes-base.code` v2 (Code node). When using the Code node:
-
-1. Replace `superCodeNodeVmSafe` with `n8n-nodes-base.code` in the node type
-2. Change `typeVersion` from `1` to `2`
-3. Set `parameters.mode` to `"runOnceForAllItems"`
-4. Move all the Zod + helper logic into `parameters.jsCode`
-5. **Handle webhook input nesting**: When the workflow is triggered via webhook, data arrives nested under `body`. The Code node must handle both formats:
-   ```javascript
-   const rawInput = items[0].json;
-   const input = rawInput.body || rawInput;
-   ```
-6. Remove the Super Code-specific `parameters.schema` and `parameters.formatter` fields — the Code node doesn't use them
-
 ### 4. Preserve the helper functions
 
-The Super Code / Code node includes four helper functions that must be kept verbatim:
+The Super Code node includes four helper functions that must be kept verbatim from the source workflow:
 
 1. `getDefaults(schema)` — recursively extracts default values from a Zod schema
 2. `setDefaults(item, defaultConfig)` — merges input with defaults, removes null/undefined
 3. `processData(item, defaultConfig, formatDataFn)` — validates with safeParse, throws formatted error on failure
 4. Entry logic — handles both `item` (single) and `items` (batch) execution modes
 
-When using the Code node fallback, these helpers go inside `jsCode` along with the schema and the entry logic.
+**Complete Super Code node code template** (adapt schema and model identifier):
+```javascript
+const Schema = z.object({
+  model: z.string().default("<model-identifier>"),
+  input: z.object({
+    // ... fields from docs
+  })
+})
+
+const defaults = getDefaults(Schema);
+
+if (typeof item !== "undefined"){
+  return processData(item, defaults, (data) => {
+    const {model, ...rest} = data
+    return {model, input: rest}
+  })
+}
+
+if (typeof items !== "undefined"){
+  return items.map(item => processData(item, defaults, (data) => {
+    const {model, ...rest} = data
+    return {model, input: rest}
+  }))
+}
+
+// ################################################################# //
+
+function getDefaults(schema) {
+  if (!(schema instanceof z.ZodObject)) return undefined;
+  const shape = schema.shape;
+  return Object.fromEntries(
+    Object.entries(shape).map(([key, value]) => {
+      if (value instanceof z.ZodDefault) {
+        return [key, value._def.defaultValue()];
+      }
+      if (value instanceof z.ZodObject) {
+        return [key, getDefaults(value)];
+      }
+      return [key, undefined];
+    })
+  );
+}
+
+function setDefaults(item, defaultConfig) {
+  const data = item?.json ? item.json : item ;
+  const allKeys = [...new Set([...Object.keys(data), ...Object.keys(defaultConfig)])];
+  const processed = {};
+  allKeys.forEach(key => {
+    const value = data[key];
+    const finalValue = (value === null || value === undefined)
+      ? defaultConfig[key]
+      : value;
+    if (finalValue !== null && finalValue !== undefined) {
+      processed[key] = finalValue;
+    }
+  });
+  return processed;
+}
+
+function processData(item, defaultConfig, formatDataFn = (data) => data){
+  item = item?.json ? item.json : item
+  const data = formatDataFn(setDefaults(item, defaultConfig))
+  const result = Schema.safeParse(data)
+  if (result.success) {
+    return result.data
+  } else {
+    const issues = result.error.issues.map(issue =>
+      `  • ▶️ ${issue.path.join('.')}: ${issue.message} (expected ${issue.expected}, got ${issue.received})`
+    ).join('\n');
+    throw new Error(`⚠️ Validation Error:\n${issues}`);
+  }
+}
+```
 
 ### 5. Set the Start node inputs
 
@@ -140,45 +195,38 @@ Map each Zod `input` field to a workflow input. Order: `prompt` first, then requ
 
 ### 6. Build the Return node
 
-The Return (Set) node shapes the output using Assignments mode (`mode: "manual"`):
-
-> **CRITICAL**: Use `mode: "manual"` with `assignments.assignments[]` — do NOT use `mode: "raw"` with `jsonOutput`. The `jsonOutput` mode fails validation when expressions like `$json.data.resultJson.parseJson()` are used.
+The Return (Set) node shapes the output using the source workflow's assignments format (object type with inline expression):
 
 - **For image/video models** (output via `resultUrls`):
   ```json
   {
-    "mode": "manual",
     "assignments": {
       "assignments": [
         {
           "name": "generated_image",
-          "value": "={{ $json.data.resultJson.parseJson().resultUrls }}",
-          "type": "arrayValue"
-        },
-        {
-          "name": "filename",
-          "value": "={{ $json.data.resultJson.parseJson().resultUrls[0].split('/').at(-1) }}",
-          "type": "stringValue"
+          "type": "object",
+          "value": "={\n  url: \"{{ $json.data.resultJson.parseJson().resultUrls }}\",\n  filename: \"{{ $json.data.resultJson.parseJson().resultUrls[0].split('/').at(-1) }}\"\n}"
         }
       ]
-    }
+    },
+    "options": {}
   }
   ```
-  (Replace `generated_image` with `generated_video` and `arrayValue` stays the same for video models)
+  (Replace `generated_image` with `generated_video` for video models)
 
 - **For text models** (output via `resultObject`):
   ```json
   {
-    "mode": "manual",
     "assignments": {
       "assignments": [
         {
           "name": "generated_text",
-          "value": "={{ $json.data.resultJson.parseJson().resultObject }}",
-          "type": "stringValue"
+          "type": "stringValue",
+          "value": "={{ $json.data.resultJson.parseJson().resultObject }}"
         }
       ]
-    }
+    },
+    "options": {}
   }
   ```
 
@@ -201,24 +249,22 @@ Set content to:
 https://kie.ai/<provider>?model=<url-encoded-model-identifier>
 ```
 
-### 9. Create or duplicate the workflow
+### 9. Duplicate the workflow from a source
 
-**Preferred: Duplicate from an existing kie.ai workflow** (fastest, most reliable):
+> **MANDATORY**: Always duplicate from an existing kie.ai workflow. Never build node-by-node from scratch. Duplicating preserves all subtle configuration details (Switch rules with condition IDs, HTTP Request options, authentication setup, etc.) that are extremely difficult to reconstruct correctly.
+
+**Steps:**
 1. Use `n8n_get_workflow` on the source workflow with `mode: "full"`
 2. Clear the `id` field from the workflow JSON and from every node
-3. Modify the nodes:
-   - Super Code or Code node: update Zod schema + model identifier
-   - Start node: update workflow inputs to match new schema
-   - Return node: update output field names and expressions
-   - "Get Generated [Media]" node: rename to match output type (Image/Video/Result)
-   - Sticky Note: update docs URL
-4. Create with `n8n_create_workflow`
-
-**If creating from scratch** (no source workflow to duplicate):
-1. Build all 13 nodes with the positions and connections from the reference tables
-2. Create with `n8n_create_workflow`
-
-> **IMPORTANT**: Always prefer duplicating an existing workflow over building node-by-node. Duplicating preserves all the subtle configuration details (request options, authentication setup, switch rules, etc.) that are easy to miss when constructing from scratch.
+3. Copy the exact Super Code node code structure, updating ONLY the schema and model identifier
+4. **Preserve the credentials exactly** from the source workflow — do NOT modify the `credentials` object on any node
+5. Update these nodes:
+   - **Super Code**: update Zod schema + model identifier (keep all helper functions verbatim)
+   - **Start node**: update workflow inputs to match new schema
+   - **Return node**: update output field names if needed (image vs video vs text)
+   - **"Get Generated [Media]" node**: rename to match output type (Image/Video/Result)
+   - **Sticky Note**: update docs URL
+6. Create with `n8n_create_workflow`
 
 ### 10. Post-creation steps
 
@@ -228,25 +274,28 @@ https://kie.ai/<provider>?model=<url-encoded-model-identifier>
    - Add a **temporary Webhook node** (`n8n-nodes-base.webhook` v2) to the workflow
      - Set `path` to something unique like `<model-shortname>-t2i` (e.g., `seedream-t2i`)
      - Set `httpMethod` to `"POST"`
-     - Position it before the Super Code / Code node
-   - Connect Webhook → Super Code (or Code node)
+     - Set `responseMode` to `"lastNode"`
+     - Position it before the Super Code node
+   - Connect Webhook → Super Code
    - Update the Start (Execute Workflow Trigger) connections to disconnect it (or remove it temporarily)
    - Use `n8n_test_workflow` with the webhook path and a test payload
    - **After successful test**: remove the temporary Webhook node and restore the Execute Workflow Trigger connections
-4. **Report** — summarize what was created and what changed vs. the source (if any)
+4. **Report** — summarize what was created and what changed vs. the source
 
 ## Switch node configurations
 
 ### Queued Switch (checks createTask response)
 
-- **Output 0 (true/success)**: `={{ $json.code === 200 ? 0 : 1 }}`
-- **Output 1 (false/error)**: routes to Stop and Error1
+Preserve from source. Uses rules-based conditions (NOT expression mode):
+- **Output 0 "generating"**: `$json.code` equals `200` (number)
+- **Output 1 "error"**: `$json.code` not equals `200` (number)
 
 ### Status Switch (checks poll response state)
 
-- **Output 0 (success)**: `={{ ['waiting', 'queuing', 'generating'].includes($json.data.state) ? 1 : ($json.data.state === 'success' ? 0 : 2) }}`
-- **Output 1 (waiting/retrying)**: routes to Wait node
-- **Output 2 (failed)**: routes to Stop and Error
+Preserve from source. Uses rules-based conditions (NOT expression mode):
+- **Output 0 "success"**: `$json.data.state` equals `"success"` (string)
+- **Output 1 "waiting"**: `$json.data.state` matches regex `^(waiting|queuing|generating)?$`
+- **Output 2 "failed"**: `$json.data.state` equals `"fail"` (string)
 
 ## Quick reference: Standard node positions
 
@@ -293,21 +342,9 @@ Sticky Note:              [368, -448]
   "authentication": "genericCredentialType",
   "genericAuthType": "httpBearerAuth",
   "sendBody": true,
-  "bodyParameters": {
-    "parameters": [
-      {
-        "name": "body",
-        "value": "={{ JSON.stringify($json) }}"
-      }
-    ]
-  },
-  "options": {
-    "response": {
-      "response": {
-        "neverError": true
-      }
-    }
-  }
+  "specifyBody": "json",
+  "jsonBody": "={{ $json.toJsonString() }}",
+  "options": {}
 }
 ```
 
@@ -315,10 +352,18 @@ Sticky Note:              [368, -448]
 
 ```json
 {
-  "method": "GET",
-  "url": "=https://api.kie.ai/api/v1/jobs/recordInfo?taskId={{ $json.data.taskId }}",
+  "url": "https://api.kie.ai/api/v1/jobs/recordInfo",
   "authentication": "genericCredentialType",
   "genericAuthType": "httpBearerAuth",
+  "sendQuery": true,
+  "queryParameters": {
+    "parameters": [
+      {
+        "name": "taskId",
+        "value": "={{ $json.data.taskId }}"
+      }
+    ]
+  },
   "options": {}
 }
 ```
@@ -328,16 +373,15 @@ Sticky Note:              [368, -448]
 - The **Queued** Switch checks `code === 200` (generating) vs not (error → Stop and Error1 with `$json.msg`)
 - The **Switch** (after polling) checks `data.state`: `success` → loop done, `waiting|queuing|generating` → wait & retry, `fail` → Stop and Error with `data.failMsg || data.errorMessage`
 - The **Wait** node uses a 5-second delay between polls
-- The Create Task HTTP Request should have `neverError: true` in response options so error responses can be checked by the Switch node instead of failing immediately
 
 ## Critical rules
 
 - **Never include `nsfw_checker`** in any schema, input, or payload — always skip it regardless of what the docs say
-- **Preferred: Super Code node** (`@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1) — but if not installed, **fall back to Code node** (`n8n-nodes-base.code` v2) with `mode: "runOnceForAllItems"` and webhook `body` nesting handling
+- **ALWAYS use the Super Code node** (`@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe` v1) — NEVER use `n8n-nodes-base.code` or any other node type as a fallback. The Super Code node must be installed on the n8n instance.
+- **ALWAYS duplicate from a source workflow** — never build node-by-node from scratch. Preserving Switch rules, credential references, and HTTP configurations is critical.
+- **Preserve credentials exactly** from the source workflow — copy the `credentials` object as-is on all HTTP Request nodes without modification
 - **Credential key MUST be `httpBearerAuth`** — never use `genericAuthType` or any other key in the `credentials` object
-- **Return node MUST use `mode: "manual"` with `assignments`** — never use `mode: "raw"` with `jsonOutput` (it fails validation with expressions)
-- **Always prefer duplicating** an existing kie.ai workflow over building node-by-node — it preserves subtle config details
-- Always use the "Kie.ai Token" bearer auth credential
+- **Return node uses object-type assignments** — follow the source workflow format with `type: "object"` and inline expression values
 - Always auto-fix type versions after creation
-- The Super Code or Code node must contain the complete Zod schema + all helper functions — no external dependencies
+- The Super Code node must contain the complete Zod schema + all helper functions — no external dependencies
 - For testing: add a temporary Webhook node, test, then clean up and remove it afterward
